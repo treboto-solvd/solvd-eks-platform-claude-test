@@ -1,0 +1,20 @@
+{
+    "KeyMetadata": {
+        "AWSAccountId": "524130862162",
+        "KeyId": "7502f308-e262-4de1-b49c-5c6056bb03b9",
+        "Arn": "arn:aws:kms:us-east-1:524130862162:key/7502f308-e262-4de1-b49c-5c6056bb03b9",
+        "CreationDate": "2026-05-19T17:35:14.813000-03:00",
+        "Enabled": true,
+        "Description": "KMS key for eks-platform-tfstate",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "KeyState": "Enabled",
+        "Origin": "AWS_KMS",
+        "KeyManager": "CUSTOMER",
+        "CustomerMasterKeySpec": "SYMMETRIC_DEFAULT",
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "EncryptionAlgorithms": [
+            "SYMMETRIC_DEFAULT"
+        ],
+        "MultiRegion": false
+    }
+}

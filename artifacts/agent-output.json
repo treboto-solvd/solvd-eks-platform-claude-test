@@ -1,0 +1,10 @@
+{
+  "stage": "test",
+  "status": "success",
+  "reason": "Test stage validation passed (AWS API fallback) — cluster_status=ACTIVE, active_nodegroups=2",
+  "timestamp": "2026-04-23T00:49:48Z",
+  "elapsed_seconds": 56,
+  "commit": "local",
+  "run_id": "local",
+  "actor": "local"
+}

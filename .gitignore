@@ -1,0 +1,16 @@
+# Node
+app/node_modules/
+app/dist/
+
+# Terraform local cache and state
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Local environment overrides
+*.tfvars.local
+
+# OS/editor
+.DS_Store
+.vscode/

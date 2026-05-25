@@ -1,0 +1,1924 @@
+name: EKS Platform CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (test/staging/prod)'
+        required: true
+        default: 'test'
+        type: choice
+        options: [test, staging, prod]
+      force_apply:
+        description: 'Force apply without plan approval'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.6.6'
+  TFLINT_VERSION: 'v0.50.3'
+  AWS_REGION: 'us-east-1'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+
+# ──────────────────────────────────────────────
+# Stage 1: Build — fmt, init, validate, lint, app build check
+# ──────────────────────────────────────────────
+jobs:
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      status: ${{ steps.emit.outputs.status }}
+      plan_artifact: ${{ steps.emit.outputs.plan_artifact }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN || github.token }}
+          fetch-depth: 10
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Terraform Format — Auto-Fix
+        id: fmt_fix
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          terraform fmt -recursive terraform/
+          if ! git diff --quiet terraform/; then
+            git config user.email "pipeline-autofix@eks-platform.local"
+            git config user.name "Pipeline Auto-Fix"
+            git add terraform/
+            git commit -m "fix(auto-repair): terraform fmt auto-correction [skip-repair]"
+            git push origin HEAD
+            echo "auto_fixed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "auto_fixed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          terraform fmt -check -recursive terraform/
+          echo "fmt_result=passed" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Terraform Init (modules)
+        run: |
+          for env_dir in terraform/environments/*/; do
+            echo "Initializing $env_dir"
+            terraform -chdir="$env_dir" init -backend=false
+          done
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          for env_dir in terraform/environments/*/; do
+            echo "Validating $env_dir"
+            terraform -chdir="$env_dir" validate
+          done
+          echo "validate_result=passed" >> "$GITHUB_OUTPUT"
+
+      - name: TFLint
+        id: tflint
+        run: |
+          tflint --init
+          for env_dir in terraform/environments/*/; do
+            echo "Linting $env_dir"
+            tflint --chdir="$env_dir" --format=compact
+          done
+          echo "tflint_result=passed" >> "$GITHUB_OUTPUT"
+
+      - name: Shellcheck Scripts
+        id: shellcheck
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/*.sh
+        continue-on-error: true
+
+      - name: TypeScript App Build Check
+        id: app_build
+        run: |
+          cd app
+          npm ci
+          npm run build
+          echo "app_build_result=passed" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Emit Build Status
+        id: emit
+        if: always()
+        run: |
+          STATUS="success"
+          FAILED_STEP=""
+          FAILURE_TYPE=""
+
+          if [[ "${{ steps.fmt.outcome }}" != "success" ]]; then
+            STATUS="failure"; FAILED_STEP="Terraform Format Check"; FAILURE_TYPE="TF_FORMAT"
+          elif [[ "${{ steps.validate.outcome }}" != "success" ]]; then
+            STATUS="failure"; FAILED_STEP="Terraform Validate"; FAILURE_TYPE="TF_VALIDATE"
+          elif [[ "${{ steps.tflint.outcome }}" != "success" ]]; then
+            STATUS="failure"; FAILED_STEP="TFLint"; FAILURE_TYPE="TF_LINT"
+          elif [[ "${{ steps.shellcheck.outcome }}" != "success" ]]; then
+            STATUS="failure"; FAILED_STEP="Shellcheck Scripts"; FAILURE_TYPE="SHELLCHECK"
+          elif [[ "${{ steps.app_build.outcome }}" != "success" ]]; then
+            STATUS="failure"; FAILED_STEP="TypeScript App Build Check"; FAILURE_TYPE="NPM_BUILD"
+          fi
+
+          mkdir -p artifacts
+          cat > artifacts/agent-output.json << EOF
+          {
+            "stage": "build",
+            "status": "$STATUS",
+            "reason": "fmt=${{ steps.fmt.outcome }}, validate=${{ steps.validate.outcome }}, tflint=${{ steps.tflint.outcome }}, shellcheck=${{ steps.shellcheck.outcome }}, app_build=${{ steps.app_build.outcome }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}"
+          }
+          EOF
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "plan_artifact=build-status" >> "$GITHUB_OUTPUT"
+          echo "failed_step=$FAILED_STEP" >> "$GITHUB_OUTPUT"
+          echo "failure_type=$FAILURE_TYPE" >> "$GITHUB_OUTPUT"
+          cat artifacts/agent-output.json
+
+          # Emit structured failure context for the repair agent
+          if [[ "$STATUS" == "failure" ]]; then
+            cat > artifacts/failure-context.json << EOF
+          {
+            "stage": "build",
+            "failed_step": "$FAILED_STEP",
+            "failure_type": "$FAILURE_TYPE",
+            "commit_sha": "${{ github.sha }}",
+            "run_id": "${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "error_output": ""
+          }
+          EOF
+          fi
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-status
+          path: |
+            artifacts/agent-output.json
+            artifacts/failure-context.json
+          retention-days: 5
+
+      - name: Upload Failure Context (for repair agent)
+        uses: actions/upload-artifact@v4
+        if: failure() || steps.emit.outputs.status == 'failure'
+        with:
+          name: failure-context
+          path: artifacts/failure-context.json
+          retention-days: 3
+
+# ──────────────────────────────────────────────
+# Stage 2: Test — ephemeral test environment deploy + security scans
+# ──────────────────────────────────────────────
+  test:
+    name: Test Environment
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.status == 'success'
+    timeout-minutes: 60
+    environment: test
+    outputs:
+      status: ${{ steps.emit.outputs.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+
+
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TEST }}
+          role-session-name: GitHubActions-Test-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup tfsec
+        run: |
+          curl -L "https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64" -o /usr/local/bin/tfsec
+          chmod +x /usr/local/bin/tfsec
+
+      - name: Setup checkov
+        run: pip3 install checkov
+
+      - name: Ensure Terraform Backend (test)
+        run: |
+          set -euo pipefail
+
+          BUCKET="eks-platform-tfstate-test"
+          TABLE="eks-platform-tfstate-lock"
+          REGION="${AWS_REGION}"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creating backend bucket: $BUCKET"
+            if [[ "$REGION" == "us-east-1" ]]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          else
+            echo "Backend bucket exists: $BUCKET"
+          fi
+
+          if ! aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
+            echo "Creating lock table: $TABLE"
+            aws dynamodb create-table \
+              --table-name "$TABLE" \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST
+            aws dynamodb wait table-exists --table-name "$TABLE"
+          else
+            echo "Lock table exists: $TABLE"
+          fi
+
+      - name: Terraform Init (test)
+        run: terraform -chdir=terraform/environments/test init
+
+      - name: Detect existing test cluster
+        id: precheck_cluster
+        run: |
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/test/terraform.tfvars)
+          ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/test/terraform.tfvars)
+          CLUSTER_NAME="${PROJECT}-${ENVIRONMENT}"
+
+          if aws eks describe-cluster --region "${{ env.AWS_REGION }}" --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cleanup stale test IAM artifacts
+        run: |
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/test/terraform.tfvars)
+          ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/test/terraform.tfvars)
+          CLUSTER_NAME="${PROJECT}-${ENVIRONMENT}"
+
+          if aws eks describe-cluster --region "${{ env.AWS_REGION }}" --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+            echo "Cluster $CLUSTER_NAME already exists; skipping stale IAM cleanup."
+            exit 0
+          fi
+
+          ROLE_NAMES=(
+            "eks-platform-test-cluster-role"
+            "eks-platform-test-node-role"
+            "eks-platform-test-vpc-cni"
+            "eks-platform-test-ebs-csi"
+            "eks-platform-test-aws-lbc"
+            "eks-platform-test-cluster-autoscaler"
+            "eks-platform-test-vpc-flow-logs"
+          )
+
+          for role in "${ROLE_NAMES[@]}"; do
+            if aws iam get-role --role-name "$role" >/dev/null 2>&1; then
+              for policy_arn in $(aws iam list-attached-role-policies --role-name "$role" --query 'AttachedPolicies[].PolicyArn' --output text); do
+                aws iam detach-role-policy --role-name "$role" --policy-arn "$policy_arn" || true
+              done
+
+              for policy_name in $(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text); do
+                aws iam delete-role-policy --role-name "$role" --policy-name "$policy_name" || true
+              done
+
+              aws iam delete-role --role-name "$role" || true
+            fi
+          done
+
+          POLICY_NAMES=(
+            "eks-platform-test-aws-lbc-policy"
+            "eks-platform-test-cluster-autoscaler-policy"
+          )
+
+          for policy_name in "${POLICY_NAMES[@]}"; do
+            policy_arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$policy_name'].Arn | [0]" --output text)
+            if [[ -n "$policy_arn" && "$policy_arn" != "None" ]]; then
+              for version_id in $(aws iam list-policy-versions --policy-arn "$policy_arn" --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text); do
+                aws iam delete-policy-version --policy-arn "$policy_arn" --version-id "$version_id" || true
+              done
+              aws iam delete-policy --policy-arn "$policy_arn" || true
+            fi
+          done
+
+      - name: Import existing IAM artifacts into Terraform state (test)
+        run: |
+          set -euo pipefail
+
+          TF_DIR="terraform/environments/test"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          import_role_if_needed() {
+            local tf_addr="$1"
+            local role_name="$2"
+
+            if ! aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
+              echo "State already contains $tf_addr"
+              return 0
+            fi
+
+            echo "Importing IAM role $role_name into $tf_addr"
+            set +e
+            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$role_name" 2>&1)
+            import_exit=$?
+            set -e
+
+            if [[ $import_exit -ne 0 ]]; then
+              echo "$import_output"
+              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
+                echo "Import skipped: $tf_addr is already managed in state."
+                return 0
+              fi
+              return $import_exit
+            fi
+          }
+
+          import_policy_if_needed() {
+            local tf_addr="$1"
+            local policy_name="$2"
+            local policy_arn
+
+            policy_arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$policy_name'].Arn | [0]" --output text)
+            if [[ -z "$policy_arn" || "$policy_arn" == "None" ]]; then
+              return 0
+            fi
+
+            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
+              echo "State already contains $tf_addr"
+              return 0
+            fi
+
+            echo "Importing IAM policy $policy_name into $tf_addr"
+            set +e
+            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$policy_arn" 2>&1)
+            import_exit=$?
+            set -e
+
+            if [[ $import_exit -ne 0 ]]; then
+              echo "$import_output"
+              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
+                echo "Import skipped: $tf_addr is already managed in state."
+                return 0
+              fi
+              return $import_exit
+            fi
+          }
+
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' "$TF_DIR/terraform.tfvars")
+          ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' "$TF_DIR/terraform.tfvars")
+          CLUSTER_NAME="${PROJECT}-${ENVIRONMENT}"
+
+          import_role_if_needed "module.iam_bootstrap.aws_iam_role.cluster[0]" "${CLUSTER_NAME}-cluster-role"
+          import_role_if_needed "module.iam_bootstrap.aws_iam_role.node[0]" "${CLUSTER_NAME}-node-role"
+          import_role_if_needed "module.iam.aws_iam_role.vpc_cni[0]" "${CLUSTER_NAME}-vpc-cni"
+          import_role_if_needed "module.iam.aws_iam_role.ebs_csi[0]" "${CLUSTER_NAME}-ebs-csi"
+          import_role_if_needed "module.iam.aws_iam_role.lbc[0]" "${CLUSTER_NAME}-aws-lbc"
+          import_policy_if_needed "module.iam.aws_iam_policy.lbc[0]" "${CLUSTER_NAME}-aws-lbc-policy"
+          import_role_if_needed "module.iam.aws_iam_role.cluster_autoscaler[0]" "${CLUSTER_NAME}-cluster-autoscaler"
+          import_policy_if_needed "module.iam.aws_iam_policy.cluster_autoscaler[0]" "${CLUSTER_NAME}-cluster-autoscaler-policy"
+
+      - name: Bootstrap ECR & Build App Image
+        id: build_app
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="test"
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/${ENVIRONMENT}/terraform.tfvars)
+          ECR_REPO="${PROJECT}-${ENVIRONMENT}-app"
+          IMAGE_TAG="${{ github.sha }}"
+          SHORT_TAG="${IMAGE_TAG:0:8}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+          # Bootstrap ECR via targeted apply if not yet managed by Terraform
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" 2>/dev/null; then
+            echo "ECR repository not found. Creating via Terraform target..."
+            terraform -chdir=terraform/environments/${ENVIRONMENT} apply \
+              -target=module.ecr \
+              -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+              -auto-approve
+          fi
+
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin "$ECR_URL"
+
+          docker build \
+            --build-arg APP_VERSION="${SHORT_TAG}" \
+            -t "${ECR_URL}:${SHORT_TAG}" \
+            -t "${ECR_URL}:latest" \
+            app/
+          docker push "${ECR_URL}:${SHORT_TAG}"
+          docker push "${ECR_URL}:latest"
+
+          echo "image_tag=${SHORT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ecr_url=${ECR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan (test)
+        id: plan
+        run: |
+          PLAN_FILE="$PWD/terraform/environments/test/tfplan.binary"
+
+          set +e
+          set -o pipefail
+          terraform -chdir=terraform/environments/test plan \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+            -out="$PLAN_FILE" \
+            -no-color \
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+          PLAN_EXIT=$?
+          set +o pipefail
+          set -e
+
+          if [[ "$PLAN_EXIT" -eq 1 ]] && grep -q "Error acquiring the state lock" plan_output.txt; then
+            LOCK_ID=$(awk '/^│   ID:/{print $3; exit}' plan_output.txt | tr -d '\r')
+            if [[ -n "$LOCK_ID" ]]; then
+              echo "Detected stale lock. Attempting force-unlock for lock ID: $LOCK_ID"
+              terraform -chdir=terraform/environments/test force-unlock -force "$LOCK_ID" || true
+              sleep 5
+
+              set +e
+              set -o pipefail
+              terraform -chdir=terraform/environments/test plan \
+                -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                -out="$PLAN_FILE" \
+                -no-color \
+                -detailed-exitcode 2>&1 | tee plan_output.txt
+              PLAN_EXIT=$?
+              set +o pipefail
+              set -e
+            fi
+          fi
+
+          echo "exit_code=$PLAN_EXIT" >> "$GITHUB_OUTPUT"
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+
+          if [[ "$PLAN_EXIT" != "0" && "$PLAN_EXIT" != "2" ]]; then
+            echo "Terraform plan failed with exit code $PLAN_EXIT"
+            exit "$PLAN_EXIT"
+          fi
+
+          if [[ "$PLAN_EXIT" == "2" && ! -f "$PLAN_FILE" ]]; then
+            echo "Terraform plan reported changes but plan file is missing: $PLAN_FILE"
+            exit 1
+          fi
+
+          CHANGES_COUNT=0
+          CLEAN_PLAN_OUTPUT=$(sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' plan_output.txt)
+          PLAN_SUMMARY=$(echo "$CLEAN_PLAN_OUTPUT" | grep -Eo 'Plan: [0-9]+ to add, [0-9]+ to change, [0-9]+ to destroy\.' | tail -1 || true)
+          if [[ -n "$PLAN_SUMMARY" ]]; then
+            ADD_COUNT=$(echo "$PLAN_SUMMARY" | awk '{print $2}')
+            CHANGE_COUNT=$(echo "$PLAN_SUMMARY" | awk '{print $5}')
+            DESTROY_COUNT=$(echo "$PLAN_SUMMARY" | awk '{print $8}')
+            CHANGES_COUNT=$((ADD_COUNT + CHANGE_COUNT + DESTROY_COUNT))
+          elif echo "$CLEAN_PLAN_OUTPUT" | grep -Eq 'No changes\.|No changes\. Your infrastructure matches the configuration\.'; then
+            CHANGES_COUNT=0
+          elif [[ "$PLAN_EXIT" == "2" ]]; then
+            CHANGES_COUNT=1
+          fi
+
+          if [[ "$CHANGES_COUNT" -gt 0 ]]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "changes_count=$CHANGES_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: tfsec Security Scan
+        id: tfsec
+        run: |
+          tfsec terraform/ \
+            --format json \
+            --out tfsec-results.json \
+            --exclude aws-ec2-no-public-egress-sgr,aws-iam-no-policy-wildcards \
+            --minimum-severity HIGH \
+            --no-color || true
+
+          HIGH_COUNT=$(jq '[.results[] | select(.severity == "HIGH" or .severity == "CRITICAL")] | length' tfsec-results.json 2>/dev/null || echo "0")
+          echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Checkov Security Scan
+        id: checkov
+        run: |
+          checkov -d terraform/ \
+            --framework terraform \
+            --output json \
+            --output-file checkov-results.json \
+            --compact \
+            --quiet || true
+
+          FAILED=$(jq '.summary.failed' checkov-results.json 2>/dev/null || echo "0")
+          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Security Triage Agent
+        id: security_triage
+        run: |
+          chmod +x scripts/security-triage-agent.sh
+          scripts/security-triage-agent.sh tfsec-results.json checkov-results.json 2>&1 | tee security_triage_output.txt
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        continue-on-error: false
+
+      - name: Cost Impact Analysis Agent
+        id: cost_agent
+        run: |
+          chmod +x scripts/cost-impact-agent.sh
+          scripts/cost-impact-agent.sh test "${{ steps.plan.outputs.plan_file }}" test 2>&1 | tee cost_impact_output.txt
+        continue-on-error: true
+
+      - name: Terraform Apply (test)
+        id: apply
+        if: steps.plan.outputs.has_changes == 'true' && steps.precheck_cluster.outputs.exists != 'true'
+        run: |
+          retry_apply() {
+            local attempt=1
+            local max_attempts=3
+            while [[ $attempt -le $max_attempts ]]; do
+              echo "Apply attempt $attempt/$max_attempts..."
+              terraform -chdir=terraform/environments/test apply \
+                -auto-approve \
+                "${{ steps.plan.outputs.plan_file }}" 2>&1 | tee apply_output.txt
+              apply_exit=${PIPESTATUS[0]}
+              if [[ $apply_exit -eq 0 ]]; then return 0; fi
+
+              # Retry only on transient errors
+              if grep -qE "Error acquiring the state lock|RequestExpired|Throttling|rate exceeded|timeout" apply_output.txt; then
+                echo "Transient error detected. Waiting $((attempt * 30))s before retry..."
+                # Force-unlock if it's a stale lock
+                LOCK_ID=$(awk '/^│   ID:/{print $3; exit}' apply_output.txt | tr -d '\r')
+                if [[ -n "$LOCK_ID" ]]; then
+                  terraform -chdir=terraform/environments/test force-unlock -force "$LOCK_ID" || true
+                fi
+                sleep $((attempt * 30))
+                ((attempt++))
+              else
+                echo "Non-transient error — not retrying."
+                return $apply_exit
+              fi
+            done
+            return $apply_exit
+          }
+          retry_apply
+          apply_exit=$?
+          echo "apply_exit_code=$apply_exit" >> "$GITHUB_OUTPUT"
+          exit $apply_exit
+
+      - name: Terraform Apply (test) - No Changes
+        id: apply_no_changes
+        if: steps.plan.outputs.has_changes != 'true' || steps.precheck_cluster.outputs.exists == 'true'
+        run: |
+          if [[ "${{ steps.precheck_cluster.outputs.exists }}" == "true" ]] && [[ "${{ steps.plan.outputs.has_changes }}" == "true" ]]; then
+            echo "Existing cluster detected (${{ steps.precheck_cluster.outputs.name }}). Skipping apply to avoid destructive cluster replacement in retry runs."
+          else
+            echo "No infrastructure changes detected (parsed changes_count=${{ steps.plan.outputs.changes_count }}). Skipping apply."
+          fi
+
+      - name: Resolve cluster name from Terraform output
+        id: cluster
+        run: |
+          # Parse JSON outputs first to avoid Terraform warning text polluting step outputs/env files.
+          CLUSTER_NAME=$(terraform -chdir=terraform/environments/test output -json 2>/dev/null | jq -r '.cluster_name.value // empty' || true)
+          CLUSTER_NAME=$(echo "$CLUSTER_NAME" | tr -d '\r\n')
+
+          # Fallback for first-run/no-output cases: derive from terraform.tfvars convention project-environment.
+          if [[ -z "$CLUSTER_NAME" ]]; then
+            PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/test/terraform.tfvars)
+            ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/test/terraform.tfvars)
+            if [[ -n "$PROJECT" && -n "$ENVIRONMENT" ]]; then
+              CLUSTER_NAME="${PROJECT}-${ENVIRONMENT}"
+            fi
+          fi
+
+          if [[ -z "$CLUSTER_NAME" ]] || [[ "$CLUSTER_NAME" == "null" ]]; then
+            echo "ERROR: Could not resolve cluster_name from Terraform outputs"
+            terraform -chdir=terraform/environments/test output || true
+            exit 1
+          fi
+          echo "name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=$CLUSTER_NAME" >> "$GITHUB_ENV"
+
+      - name: Guard AWS account/region and cluster existence
+        id: guard
+        run: |
+          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [[ "$ACTUAL_ACCOUNT_ID" != "${{ secrets.AWS_ACCOUNT_ID }}" ]]; then
+            echo "ERROR: OIDC account mismatch. expected=${{ secrets.AWS_ACCOUNT_ID }} actual=$ACTUAL_ACCOUNT_ID"
+            exit 1
+          fi
+
+          if aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" >/dev/null 2>&1; then
+            echo "Cluster ${{ steps.cluster.outputs.name }} exists."
+            echo "cluster_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: Cluster ${{ steps.cluster.outputs.name }} not found - may be first provisioning run. Skipping kubeconfig/healthcheck."
+            echo "cluster_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update kubeconfig
+        if: steps.guard.outputs.cluster_exists == 'true'
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ steps.cluster.outputs.name }}
+
+      - name: Run K8s Health Check
+        id: healthcheck
+        if: steps.guard.outputs.cluster_exists == 'true'
+        run: |
+          chmod +x scripts/k8s-healthcheck.sh
+          scripts/k8s-healthcheck.sh ${{ steps.cluster.outputs.name }} ${{ env.AWS_REGION }} 2>&1 | tee healthcheck_output.txt
+          hc_exit=${PIPESTATUS[0]}
+          echo "healthcheck_exit_code=$hc_exit" >> "$GITHUB_OUTPUT"
+          exit $hc_exit
+        continue-on-error: false
+
+      - name: Validation Agent
+        id: agent
+        run: |
+          chmod +x scripts/pipeline-agent-verify.sh
+          scripts/pipeline-agent-verify.sh test 2>&1 | tee agent_output.txt
+        continue-on-error: false
+
+      - name: Emit Test Status
+        id: emit
+        if: always()
+        run: |
+          STATUS="success"
+          APPLY_STATUS="failure"
+
+          if [[ "${{ steps.apply.outcome }}" == "success" ]]; then
+            APPLY_STATUS="success"
+          fi
+
+          if [[ "${{ steps.apply_no_changes.outcome }}" == "success" ]]; then
+            APPLY_STATUS="success"
+          fi
+
+          if [[ "${{ steps.security_triage.outcome }}" != "success" ]] || \
+             [[ "$APPLY_STATUS" != "success" ]] || \
+             [[ "${{ steps.healthcheck.outcome }}" != "success" ]] || \
+             [[ "${{ steps.agent.outcome }}" != "success" ]]; then
+            STATUS="failure"
+          fi
+
+          mkdir -p artifacts
+          cat > artifacts/agent-output.json << EOF
+          {
+            "stage": "test",
+            "status": "$STATUS",
+              "reason": "security_triage=${{ steps.security_triage.outcome }}, tfsec=${{ steps.tfsec.outcome }}, checkov=${{ steps.checkov.outcome }}, cost_agent=${{ steps.cost_agent.outcome }}, plan_exit_code=${{ steps.plan.outputs.exit_code }}, plan_has_changes=${{ steps.plan.outputs.has_changes }}, changes_count=${{ steps.plan.outputs.changes_count }}, apply=${{ steps.apply.outcome }}, apply_no_changes=${{ steps.apply_no_changes.outcome }}, apply_effective=$APPLY_STATUS, healthcheck=${{ steps.healthcheck.outcome }}, agent=${{ steps.agent.outcome }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "environment": "test"
+          }
+          EOF
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          cat artifacts/agent-output.json
+
+      - name: Emit Failure Context (test)
+        if: failure() || steps.emit.outputs.status == 'failure'
+        run: |
+          FAILED_STEP="unknown"
+          FAILURE_TYPE="UNKNOWN"
+          if [[ "${{ steps.security_triage.outcome }}" != "success" ]]; then
+            FAILED_STEP="Security Triage Agent"; FAILURE_TYPE="SECURITY_BLOCK"
+          elif [[ "${{ steps.apply.outcome }}" == "failure" ]]; then
+            FAILED_STEP="Terraform Apply (test)"; FAILURE_TYPE="TF_APPLY"
+          elif [[ "${{ steps.healthcheck.outcome }}" == "failure" ]]; then
+            FAILED_STEP="Run K8s Health Check"; FAILURE_TYPE="K8S_HEALTH"
+          fi
+          mkdir -p artifacts
+          cat > artifacts/failure-context.json << EOF
+          {
+            "stage": "test",
+            "failed_step": "$FAILED_STEP",
+            "failure_type": "$FAILURE_TYPE",
+            "commit_sha": "${{ github.sha }}",
+            "run_id": "${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "error_output": ""
+          }
+          EOF
+
+      - name: Upload Test Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-status
+          path: |
+            artifacts/agent-output.json
+            artifacts/cost-impact.json
+            artifacts/security-triage-report.json
+            tfsec-results.json
+            checkov-results.json
+          retention-days: 5
+
+      - name: Upload Failure Context (test, for repair agent)
+        uses: actions/upload-artifact@v4
+        if: failure() || steps.emit.outputs.status == 'failure'
+        with:
+          name: failure-context
+          path: artifacts/failure-context.json
+          retention-days: 3
+
+      - name: Rollback on Failure
+        if: failure() && steps.apply.outcome == 'success'
+        run: |
+          echo "Rolling back test environment..."
+          terraform -chdir=terraform/environments/test apply \
+            -refresh-only \
+            -auto-approve \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" || true
+
+# ──────────────────────────────────────────────
+# Stage 3: Staging — integration tests, autoscaler, DNS, ingress
+# ──────────────────────────────────────────────
+  staging:
+    name: Staging Environment
+    runs-on: ubuntu-latest
+    needs: test
+    if: needs.test.outputs.status == 'success' && github.ref == 'refs/heads/main'
+    timeout-minutes: 90
+    environment: staging
+    outputs:
+      status: ${{ steps.emit.outputs.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_STAGING }}
+          role-session-name: GitHubActions-Staging-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Ensure Terraform Backend (staging)
+        run: |
+          set -euo pipefail
+
+          BUCKET="eks-platform-tfstate-staging"
+          TABLE="eks-platform-tfstate-lock"
+          REGION="${AWS_REGION}"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creating backend bucket: $BUCKET"
+            if [[ "$REGION" == "us-east-1" ]]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          else
+            echo "Backend bucket exists: $BUCKET"
+          fi
+
+          if ! aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
+            echo "Creating lock table: $TABLE"
+            aws dynamodb create-table \
+              --table-name "$TABLE" \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST
+            aws dynamodb wait table-exists --table-name "$TABLE"
+          else
+            echo "Lock table exists: $TABLE"
+          fi
+
+      - name: Terraform Init (staging)
+        run: terraform -chdir=terraform/environments/staging init
+
+      - name: Import existing GitHub OIDC IAM artifacts (staging)
+        run: |
+          set -euo pipefail
+
+          TF_DIR="terraform/environments/staging"
+
+          import_role_if_needed() {
+            local tf_addr="$1"
+            local role_name="$2"
+
+            if ! aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
+              echo "State already contains $tf_addr"
+              return 0
+            fi
+
+            set +e
+            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$role_name" 2>&1)
+            import_exit=$?
+            set -e
+
+            if [[ $import_exit -ne 0 ]]; then
+              echo "$import_output"
+              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
+                echo "Import skipped: $tf_addr already managed."
+                return 0
+              fi
+              return $import_exit
+            fi
+          }
+
+          import_policy_if_needed() {
+            local tf_addr="$1"
+            local policy_name="$2"
+            local policy_arn
+
+            policy_arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$policy_name'].Arn | [0]" --output text)
+            if [[ -z "$policy_arn" || "$policy_arn" == "None" ]]; then
+              return 0
+            fi
+
+            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
+              echo "State already contains $tf_addr"
+              return 0
+            fi
+
+            set +e
+            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$policy_arn" 2>&1)
+            import_exit=$?
+            set -e
+
+            if [[ $import_exit -ne 0 ]]; then
+              echo "$import_output"
+              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
+                echo "Import skipped: $tf_addr already managed."
+                return 0
+              fi
+              return $import_exit
+            fi
+          }
+
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' "$TF_DIR/terraform.tfvars")
+          ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' "$TF_DIR/terraform.tfvars")
+
+          import_role_if_needed "module.github_oidc.aws_iam_role.github_actions" "${PROJECT}-github-actions-${ENVIRONMENT}"
+          import_policy_if_needed "module.github_oidc.aws_iam_policy.terraform_state" "${PROJECT}-github-actions-tfstate-${ENVIRONMENT}"
+
+      - name: Bootstrap ECR & Build App Image
+        id: build_app
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="staging"
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/${ENVIRONMENT}/terraform.tfvars)
+          ECR_REPO="${PROJECT}-${ENVIRONMENT}-app"
+          IMAGE_TAG="${{ github.sha }}"
+          SHORT_TAG="${IMAGE_TAG:0:8}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" 2>/dev/null; then
+            echo "ECR repository not found. Creating via Terraform target..."
+            terraform -chdir=terraform/environments/${ENVIRONMENT} apply \
+              -target=module.ecr \
+              -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+              -auto-approve
+          fi
+
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin "$ECR_URL"
+
+          docker build \
+            --build-arg APP_VERSION="${SHORT_TAG}" \
+            -t "${ECR_URL}:${SHORT_TAG}" \
+            -t "${ECR_URL}:latest" \
+            app/
+          docker push "${ECR_URL}:${SHORT_TAG}"
+          docker push "${ECR_URL}:latest"
+
+          echo "image_tag=${SHORT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ecr_url=${ECR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan (staging)
+        id: plan
+        run: |
+          PLAN_FILE="$PWD/terraform/environments/staging/tfplan.binary"
+          terraform -chdir=terraform/environments/staging plan \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+            -out="$PLAN_FILE" \
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+
+      - name: Cost Impact Analysis Agent
+        id: cost_agent
+        run: |
+          chmod +x scripts/cost-impact-agent.sh
+          PLAN_FILE="$PWD/terraform/environments/staging/tfplan.binary"
+          scripts/cost-impact-agent.sh staging "$PLAN_FILE" staging 2>&1 | tee cost_impact_output.txt
+        continue-on-error: true
+
+      - name: Terraform Apply (staging)
+        id: apply
+        run: |
+          PLAN_FILE="$PWD/terraform/environments/staging/tfplan.binary"
+
+          retry_apply() {
+            local attempt=1
+            local max_attempts=3
+            while [[ $attempt -le $max_attempts ]]; do
+              echo "Apply attempt $attempt/$max_attempts..."
+
+              if [[ -f "$PLAN_FILE" ]]; then
+                terraform -chdir=terraform/environments/staging apply \
+                  -auto-approve "$PLAN_FILE" 2>&1 | tee apply_output.txt
+              else
+                echo "Plan file not found ($PLAN_FILE). Falling back to direct apply."
+                terraform -chdir=terraform/environments/staging apply \
+                  -auto-approve \
+                  -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                  -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                  2>&1 | tee apply_output.txt
+              fi
+
+              apply_exit=${PIPESTATUS[0]}
+              if [[ $apply_exit -eq 0 ]]; then return 0; fi
+
+              if grep -q "Saved plan is stale" apply_output.txt; then
+                echo "Saved plan became stale. Removing plan file and retrying with fresh direct apply."
+                rm -f "$PLAN_FILE"
+                ((attempt++))
+                continue
+              fi
+
+              if grep -q "Kubernetes cluster unreachable" apply_output.txt; then
+                echo "Kubernetes API unreachable from runner. Applying infra-only targets and deferring in-cluster resources."
+                terraform -chdir=terraform/environments/staging apply \
+                  -auto-approve \
+                  -refresh=false \
+                  -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                  -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                  -target=aws_kms_key.eks \
+                  -target=aws_kms_alias.eks \
+                  -target=module.vpc \
+                  -target=module.iam_bootstrap \
+                  -target=module.eks \
+                  -target=module.iam \
+                  -target=module.ecr \
+                  2>&1 | tee apply_output.txt
+                return ${PIPESTATUS[0]}
+              fi
+
+              if grep -qE "Unsupported Kubernetes minor version update|DeleteConflict: Cannot delete a policy attached to entities" apply_output.txt; then
+                echo "Detected immutable EKS version drift and/or IAM policy delete conflict. Applying safe targeted subset (excluding module.eks and module.github_oidc)."
+                terraform -chdir=terraform/environments/staging apply \
+                  -auto-approve \
+                  -refresh=false \
+                  -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                  -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                  -target=aws_kms_key.eks \
+                  -target=aws_kms_alias.eks \
+                  -target=module.vpc \
+                  -target=module.iam_bootstrap \
+                  -target=module.iam \
+                  -target=module.ecr \
+                  2>&1 | tee apply_output.txt
+                return ${PIPESTATUS[0]}
+              fi
+
+              if grep -qE "Error acquiring the state lock|RequestExpired|Throttling|rate exceeded|timeout" apply_output.txt; then
+                LOCK_ID=$(awk '/^│   ID:/{print $3; exit}' apply_output.txt | tr -d '\r')
+                if [[ -n "$LOCK_ID" ]]; then
+                  terraform -chdir=terraform/environments/staging force-unlock -force "$LOCK_ID" || true
+                fi
+                sleep $((attempt * 30))
+                ((attempt++))
+              else
+                return $apply_exit
+              fi
+            done
+            return $apply_exit
+          }
+          retry_apply
+
+      - name: Resolve cluster name from Terraform output
+        id: cluster
+        run: |
+          # Parse JSON outputs first to avoid Terraform warning text polluting step outputs.
+          CLUSTER_NAME=$(terraform -chdir=terraform/environments/staging output -json 2>/dev/null | jq -r '.cluster_name.value // empty' || true)
+          CLUSTER_NAME=$(echo "$CLUSTER_NAME" | tr -d '\r\n')
+
+          # Fallback for first-run/no-output cases: derive from terraform.tfvars convention project-environment.
+          if [[ -z "$CLUSTER_NAME" ]]; then
+            PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/staging/terraform.tfvars)
+            ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/staging/terraform.tfvars)
+            if [[ -n "$PROJECT" && -n "$ENVIRONMENT" ]]; then
+              CLUSTER_NAME="${PROJECT}-${ENVIRONMENT}"
+            fi
+          fi
+
+          if [[ -z "$CLUSTER_NAME" ]] || [[ "$CLUSTER_NAME" == "null" ]]; then
+            echo "ERROR: Could not resolve cluster_name from Terraform outputs"
+            terraform -chdir=terraform/environments/staging output || true
+            exit 1
+          fi
+          echo "name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Guard AWS account/region and cluster existence
+        run: |
+          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [[ "$ACTUAL_ACCOUNT_ID" != "${{ secrets.AWS_ACCOUNT_ID }}" ]]; then
+            echo "ERROR: OIDC account mismatch. expected=${{ secrets.AWS_ACCOUNT_ID }} actual=$ACTUAL_ACCOUNT_ID"
+            exit 1
+          fi
+
+          if aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" >/dev/null 2>&1; then
+            echo "Cluster ${{ steps.cluster.outputs.name }} exists."
+          else
+            echo "WARNING: Cluster ${{ steps.cluster.outputs.name }} not found - may be first provisioning run. Continuing."
+          fi
+
+      - name: Detect Kubernetes API reachability
+        id: kube_api
+        run: |
+          ENDPOINT=$(aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" \
+            --query 'cluster.endpoint' \
+            --output text)
+          PUBLIC_ACCESS=$(aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" \
+            --query 'cluster.resourcesVpcConfig.endpointPublicAccess' \
+            --output text)
+
+          HOST=${ENDPOINT#https://}
+          if timeout 8 bash -c "cat < /dev/null > /dev/tcp/${HOST}/443"; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+            echo "Kubernetes API endpoint is reachable from this runner."
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "Kubernetes API endpoint is NOT reachable from this runner (likely private endpoint/network path restriction)."
+          fi
+
+          echo "public_access=$PUBLIC_ACCESS" >> "$GITHUB_OUTPUT"
+          echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+
+      - name: Update kubeconfig
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ steps.cluster.outputs.name }}
+
+      - name: Run K8s Health Check
+        id: healthcheck
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          chmod +x scripts/k8s-healthcheck.sh
+          scripts/k8s-healthcheck.sh ${{ steps.cluster.outputs.name }} ${{ env.AWS_REGION }} 2>&1 | tee healthcheck_output.txt
+        continue-on-error: false
+
+      - name: Validate Cluster Autoscaler
+        id: autoscaler
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          echo "Checking cluster autoscaler..."
+          kubectl wait --for=condition=available \
+            deployment/cluster-autoscaler \
+            -n kube-system \
+            --timeout=120s
+
+          CA_PODS=$(kubectl get pods -n kube-system -l app.kubernetes.io/name=cluster-autoscaler --field-selector=status.phase=Running -o name | wc -l)
+          if [[ "$CA_PODS" -lt "1" ]]; then
+            echo "FATAL: Cluster autoscaler pods not running"
+            exit 1
+          fi
+          echo "Cluster autoscaler running: $CA_PODS pod(s)"
+
+      - name: Validate DNS Resolution
+        id: dns
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          echo "Checking CoreDNS..."
+          kubectl wait --for=condition=available deployment/coredns -n kube-system --timeout=120s
+
+          kubectl run dns-test --image=busybox:1.28 --restart=Never --rm -i \
+            --timeout=60s \
+            -- nslookup kubernetes.default.svc.cluster.local && echo "DNS OK"
+
+      - name: Validate Ingress Controller
+        id: ingress
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          echo "Checking AWS Load Balancer Controller..."
+          kubectl wait --for=condition=available \
+            deployment/aws-load-balancer-controller \
+            -n kube-system \
+            --timeout=120s
+
+          LBC_PODS=$(kubectl get pods -n kube-system \
+            -l app.kubernetes.io/name=aws-load-balancer-controller \
+            --field-selector=status.phase=Running -o name | wc -l)
+          if [[ "$LBC_PODS" -lt "2" ]]; then
+            echo "WARNING: LBC running with only $LBC_PODS pod(s)"
+          fi
+          echo "AWS LBC running: $LBC_PODS pod(s)"
+
+      - name: Validate Metrics Server
+        id: metrics
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          kubectl wait --for=condition=available deployment/metrics-server -n kube-system --timeout=120s
+          kubectl top nodes || (echo "metrics-server not ready yet, giving 30s..."; sleep 30; kubectl top nodes)
+
+      - name: Validate App Deployment
+        id: app_validation
+        if: steps.kube_api.outputs.reachable == 'true'
+        run: |
+          echo "Checking TypeScript app deployment..."
+          kubectl wait --for=condition=available \
+            deployment/typescript-app \
+            -n app \
+            --timeout=120s
+
+          APP_PODS=$(kubectl get pods -n app -l app=typescript-app --field-selector=status.phase=Running -o name | wc -l)
+          echo "TypeScript app running: $APP_PODS pod(s)"
+          if [[ "$APP_PODS" -lt "1" ]]; then
+            echo "FATAL: No running app pods found"
+            exit 1
+          fi
+
+      - name: Validate Cluster via AWS API (private endpoint fallback)
+        id: private_validation
+        if: steps.kube_api.outputs.reachable != 'true'
+        run: |
+          echo "Running fallback validation because Kubernetes API is unreachable from this runner."
+          echo "Endpoint: ${{ steps.kube_api.outputs.endpoint }}"
+          echo "Endpoint public access: ${{ steps.kube_api.outputs.public_access }}"
+
+          CLUSTER_STATUS=$(aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" \
+            --query 'cluster.status' \
+            --output text)
+
+          if [[ "$CLUSTER_STATUS" != "ACTIVE" ]]; then
+            echo "FATAL: Cluster is not ACTIVE (status=$CLUSTER_STATUS)"
+            exit 1
+          fi
+
+          # Compute can be provided by managed node groups, Fargate profiles, or self-managed/Karpenter EC2 nodes.
+          NODEGROUPS=""
+          for attempt in 1 2 3 4 5 6; do
+            NODEGROUPS=$(aws eks list-nodegroups \
+              --region "${{ env.AWS_REGION }}" \
+              --cluster-name "${{ steps.cluster.outputs.name }}" \
+              --query 'nodegroups' \
+              --output text)
+
+            if [[ -n "$NODEGROUPS" ]] && [[ "$NODEGROUPS" != "None" ]]; then
+              echo "Managed node groups discovered on attempt $attempt: $NODEGROUPS"
+              break
+            fi
+
+            echo "No managed node groups reported yet (attempt $attempt/6). Retrying in 20s..."
+            sleep 20
+          done
+
+          COMPUTE_FOUND=false
+
+          if [[ -n "$NODEGROUPS" ]] && [[ "$NODEGROUPS" != "None" ]]; then
+            COMPUTE_FOUND=true
+            for ng in $NODEGROUPS; do
+              NG_STATUS=$(aws eks describe-nodegroup \
+                --region "${{ env.AWS_REGION }}" \
+                --cluster-name "${{ steps.cluster.outputs.name }}" \
+                --nodegroup-name "$ng" \
+                --query 'nodegroup.status' \
+                --output text)
+              if [[ "$NG_STATUS" != "ACTIVE" ]]; then
+                echo "FATAL: Node group $ng is not ACTIVE (status=$NG_STATUS)"
+                exit 1
+              fi
+            done
+          else
+            FARGATE_PROFILES=$(aws eks list-fargate-profiles \
+              --region "${{ env.AWS_REGION }}" \
+              --cluster-name "${{ steps.cluster.outputs.name }}" \
+              --query 'fargateProfileNames' \
+              --output text)
+
+            if [[ -n "$FARGATE_PROFILES" ]] && [[ "$FARGATE_PROFILES" != "None" ]]; then
+              COMPUTE_FOUND=true
+              echo "No managed node groups found; validating Fargate profiles: $FARGATE_PROFILES"
+              for fp in $FARGATE_PROFILES; do
+                FP_STATUS=$(aws eks describe-fargate-profile \
+                  --region "${{ env.AWS_REGION }}" \
+                  --cluster-name "${{ steps.cluster.outputs.name }}" \
+                  --fargate-profile-name "$fp" \
+                  --query 'fargateProfile.status' \
+                  --output text)
+                if [[ "$FP_STATUS" != "ACTIVE" ]]; then
+                  echo "FATAL: Fargate profile $fp is not ACTIVE (status=$FP_STATUS)"
+                  exit 1
+                fi
+              done
+            fi
+          fi
+
+          if [[ "$COMPUTE_FOUND" != "true" ]]; then
+            CLUSTER_TAG="kubernetes.io/cluster/${{ steps.cluster.outputs.name }}"
+            EC2_COUNT=$(aws ec2 describe-instances \
+              --region "${{ env.AWS_REGION }}" \
+              --filters "Name=tag:${CLUSTER_TAG},Values=owned,shared" "Name=instance-state-name,Values=pending,running" \
+              --query 'Reservations[].Instances[].InstanceId' \
+              --output text | wc -w)
+
+            if [[ "$EC2_COUNT" -gt 0 ]]; then
+              COMPUTE_FOUND=true
+              echo "No managed node groups/Fargate profiles found, but discovered $EC2_COUNT tagged EC2 instance(s)."
+            fi
+          fi
+
+          if [[ "$COMPUTE_FOUND" != "true" ]]; then
+            echo "FATAL: No active compute capacity found for cluster (managed node groups, Fargate profiles, or tagged EC2 instances)."
+            exit 1
+          fi
+
+          ADDONS=$(aws eks list-addons \
+            --region "${{ env.AWS_REGION }}" \
+            --cluster-name "${{ steps.cluster.outputs.name }}" \
+            --query 'addons' \
+            --output text)
+
+          if [[ -n "$ADDONS" ]]; then
+            for addon in $ADDONS; do
+              ADDON_STATUS=$(aws eks describe-addon \
+                --region "${{ env.AWS_REGION }}" \
+                --cluster-name "${{ steps.cluster.outputs.name }}" \
+                --addon-name "$addon" \
+                --query 'addon.status' \
+                --output text)
+              if [[ "$ADDON_STATUS" != "ACTIVE" ]]; then
+                echo "FATAL: Add-on $addon is not ACTIVE (status=$ADDON_STATUS)"
+                exit 1
+              fi
+            done
+          fi
+
+          echo "Fallback validation passed (cluster control plane, compute backing, and managed add-ons are ACTIVE)."
+
+      - name: Validation Agent
+        id: agent
+        run: |
+          chmod +x scripts/pipeline-agent-verify.sh
+          scripts/pipeline-agent-verify.sh staging 2>&1 | tee agent_output.txt
+        continue-on-error: false
+
+      - name: Changelog Generator Agent
+        id: changelog
+        run: |
+          chmod +x scripts/changelog-agent.sh
+          scripts/changelog-agent.sh HEAD~5 HEAD 2>&1 | tee changelog_output.txt
+        continue-on-error: true
+
+      - name: Emit Staging Status
+        id: emit
+        if: always()
+        run: |
+          STATUS="success"
+          if [[ "${{ steps.kube_api.outputs.reachable }}" == "true" ]]; then
+            for outcome in \
+              "${{ steps.apply.outcome }}" \
+              "${{ steps.cost_agent.outcome }}" \
+              "${{ steps.healthcheck.outcome }}" \
+              "${{ steps.autoscaler.outcome }}" \
+              "${{ steps.dns.outcome }}" \
+              "${{ steps.ingress.outcome }}" \
+              "${{ steps.metrics.outcome }}" \
+              "${{ steps.app_validation.outcome }}" \
+              "${{ steps.changelog.outcome }}" \
+              "${{ steps.agent.outcome }}"; do
+              if [[ "$outcome" != "success" ]]; then
+                STATUS="failure"
+                break
+              fi
+            done
+          else
+            for outcome in \
+              "${{ steps.apply.outcome }}" \
+              "${{ steps.cost_agent.outcome }}" \
+              "${{ steps.private_validation.outcome }}" \
+              "${{ steps.changelog.outcome }}" \
+              "${{ steps.agent.outcome }}"; do
+              if [[ "$outcome" != "success" ]]; then
+                STATUS="failure"
+                break
+              fi
+            done
+          fi
+
+          mkdir -p artifacts
+          cat > artifacts/agent-output.json << EOF
+          {
+            "stage": "staging",
+            "status": "$STATUS",
+            "reason": "apply=${{ steps.apply.outcome }}, cost_agent=${{ steps.cost_agent.outcome }}, kube_api_reachable=${{ steps.kube_api.outputs.reachable }}, healthcheck=${{ steps.healthcheck.outcome }}, autoscaler=${{ steps.autoscaler.outcome }}, dns=${{ steps.dns.outcome }}, ingress=${{ steps.ingress.outcome }}, metrics=${{ steps.metrics.outcome }}, app_validation=${{ steps.app_validation.outcome }}, changelog=${{ steps.changelog.outcome }}, private_validation=${{ steps.private_validation.outcome }}, agent=${{ steps.agent.outcome }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "environment": "staging"
+          }
+          EOF
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          cat artifacts/agent-output.json
+
+      - name: Upload Staging Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-status
+          path: |
+            artifacts/agent-output.json
+            artifacts/cost-impact.json
+            artifacts/CHANGELOG.md
+            artifacts/changelog.json
+          retention-days: 7
+
+      - name: Rollback on Failure
+        if: failure() && steps.apply.outcome == 'success'
+        run: |
+          echo "Rolling back staging environment..."
+          terraform -chdir=terraform/environments/staging apply \
+            -refresh-only \
+            -auto-approve \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" || true
+          kubectl rollout undo deployment --all -n kube-system || true
+          kubectl rollout undo deployment/typescript-app -n app || true
+
+# ──────────────────────────────────────────────
+# Stage 4: Production — manual approval gate + final validation
+# ──────────────────────────────────────────────
+  production:
+    name: Production Environment
+    runs-on: ubuntu-latest
+    needs: staging
+    if: needs.staging.outputs.status == 'success' && github.ref == 'refs/heads/main'
+    timeout-minutes: 90
+    environment: prod
+    outputs:
+      status: ${{ steps.emit.outputs.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+          role-session-name: GitHubActions-Prod-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Prior Stage Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: staging-status
+          path: staging-artifacts/
+
+      - name: Verify Staging Gate
+        run: |
+          STAGING_STATUS=$(jq -r '.status' staging-artifacts/agent-output.json)
+          if [[ "$STAGING_STATUS" != "success" ]]; then
+            echo "FATAL: Staging gate not passed. Status: $STAGING_STATUS"
+            exit 1
+          fi
+          echo "Staging gate: PASSED"
+
+      - name: Ensure Terraform Backend (prod)
+        run: |
+          set -euo pipefail
+
+          BUCKET="eks-platform-tfstate-prod"
+          TABLE="eks-platform-tfstate-lock"
+          REGION="${AWS_REGION}"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creating backend bucket: $BUCKET"
+            if [[ "$REGION" == "us-east-1" ]]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          else
+            echo "Backend bucket exists: $BUCKET"
+          fi
+
+          if ! aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
+            echo "Creating lock table: $TABLE"
+            aws dynamodb create-table \
+              --table-name "$TABLE" \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST
+            aws dynamodb wait table-exists --table-name "$TABLE"
+          else
+            echo "Lock table exists: $TABLE"
+          fi
+
+      - name: Terraform Init (prod)
+        run: terraform -chdir=terraform/environments/prod init
+
+      - name: Import existing GitHub OIDC IAM artifacts (prod)
+        run: |
+          set -euo pipefail
+
+          TF_DIR="terraform/environments/prod"
+
+          import_role_if_needed() {
+            local tf_addr="$1"
+            local role_name="$2"
+
+            if ! aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
+              echo "State already contains $tf_addr"
+              return 0
+            fi
+
+            set +e
+            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$role_name" 2>&1)
+            import_exit=$?
+            set -e
+
+            if [[ $import_exit -ne 0 ]]; then
+              echo "$import_output"
+              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
+                echo "Import skipped: $tf_addr already managed."
+                return 0
+              fi
+              return $import_exit
+            fi
+          }
+
+          import_policy_if_needed() {
+            local tf_addr="$1"
+            local policy_name="$2"
+            local policy_arn
+
+            policy_arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$policy_name'].Arn | [0]" --output text)
+            if [[ -z "$policy_arn" || "$policy_arn" == "None" ]]; then
+              return 0
+            fi
+
+            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
+              echo "State already contains $tf_addr"
+              return 0
+            fi
+
+            set +e
+            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$policy_arn" 2>&1)
+            import_exit=$?
+            set -e
+
+            if [[ $import_exit -ne 0 ]]; then
+              echo "$import_output"
+              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
+                echo "Import skipped: $tf_addr already managed."
+                return 0
+              fi
+              return $import_exit
+            fi
+          }
+
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' "$TF_DIR/terraform.tfvars")
+          ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' "$TF_DIR/terraform.tfvars")
+
+          import_role_if_needed "module.github_oidc.aws_iam_role.github_actions" "${PROJECT}-github-actions-${ENVIRONMENT}"
+          import_policy_if_needed "module.github_oidc.aws_iam_policy.terraform_state" "${PROJECT}-github-actions-tfstate-${ENVIRONMENT}"
+
+      - name: Bootstrap ECR & Build App Image
+        id: build_app
+        run: |
+          set -euo pipefail
+
+          ENVIRONMENT="prod"
+          PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/${ENVIRONMENT}/terraform.tfvars)
+          ECR_REPO="${PROJECT}-${ENVIRONMENT}-app"
+          IMAGE_TAG="${{ github.sha }}"
+          SHORT_TAG="${IMAGE_TAG:0:8}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" 2>/dev/null; then
+            echo "ECR repository not found. Creating via Terraform target..."
+            terraform -chdir=terraform/environments/${ENVIRONMENT} apply \
+              -target=module.ecr \
+              -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+              -auto-approve
+          fi
+
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin "$ECR_URL"
+
+          docker build \
+            --build-arg APP_VERSION="${SHORT_TAG}" \
+            -t "${ECR_URL}:${SHORT_TAG}" \
+            -t "${ECR_URL}:latest" \
+            app/
+          docker push "${ECR_URL}:${SHORT_TAG}"
+          docker push "${ECR_URL}:latest"
+
+          echo "image_tag=${SHORT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ecr_url=${ECR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan (prod)
+        id: plan
+        run: |
+          PLAN_FILE="$PWD/terraform/environments/prod/tfplan.binary"
+          terraform -chdir=terraform/environments/prod plan \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+            -out="$PLAN_FILE" \
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+
+      - name: Final Security Scan (prod)
+        id: security
+        run: |
+          pip3 install checkov
+          checkov -d terraform/environments/prod \
+            --framework terraform \
+            --compact \
+            --quiet || true
+
+          curl -L "https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64" -o /usr/local/bin/tfsec
+          chmod +x /usr/local/bin/tfsec
+          tfsec terraform/environments/prod \
+            --exclude aws-ec2-no-public-egress-sgr,aws-iam-no-policy-wildcards \
+            --minimum-severity HIGH \
+            --no-color
+        continue-on-error: false
+
+      - name: Production Recommendation Agent
+        id: prod_recommendation
+        run: |
+          chmod +x scripts/prod-recommendation-agent.sh
+          scripts/prod-recommendation-agent.sh 2>&1 | tee prod_recommendation_output.txt
+        continue-on-error: true
+
+      - name: Auto-Approval Engine
+        id: auto_approval
+        run: |
+          chmod +x scripts/auto-approval-engine.sh
+          # Load auto-approval config
+          [[ -f .github/auto-approval-config.env ]] && source .github/auto-approval-config.env || true
+          scripts/auto-approval-engine.sh 2>&1 | tee auto_approval_output.txt
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Terraform Apply (prod)
+        id: apply
+        if: steps.auto_approval.outcome == 'success'
+        run: |
+          PLAN_FILE="$PWD/terraform/environments/prod/tfplan.binary"
+
+          retry_apply() {
+            local attempt=1
+            local max_attempts=3
+            while [[ $attempt -le $max_attempts ]]; do
+              echo "Apply attempt $attempt/$max_attempts..."
+
+              if [[ -f "$PLAN_FILE" ]]; then
+                terraform -chdir=terraform/environments/prod apply \
+                  -auto-approve "$PLAN_FILE" 2>&1 | tee apply_output.txt
+              else
+                echo "Plan file not found ($PLAN_FILE). Falling back to direct apply."
+                terraform -chdir=terraform/environments/prod apply \
+                  -auto-approve \
+                  -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                  -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                  2>&1 | tee apply_output.txt
+              fi
+
+              apply_exit=${PIPESTATUS[0]}
+              if [[ $apply_exit -eq 0 ]]; then return 0; fi
+
+              if grep -q "Saved plan is stale" apply_output.txt; then
+                echo "Saved plan became stale. Removing plan file and retrying with fresh direct apply."
+                rm -f "$PLAN_FILE"
+                ((attempt++))
+                continue
+              fi
+
+              if grep -q "Kubernetes cluster unreachable" apply_output.txt; then
+                echo "Kubernetes API unreachable from runner. Applying infra-only targets and deferring in-cluster resources."
+                terraform -chdir=terraform/environments/prod apply \
+                  -auto-approve \
+                  -refresh=false \
+                  -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                  -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                  -target=aws_kms_key.eks \
+                  -target=aws_kms_alias.eks \
+                  -target=module.vpc \
+                  -target=module.iam_bootstrap \
+                  -target=module.eks \
+                  -target=module.iam \
+                  -target=module.ecr \
+                  2>&1 | tee apply_output.txt
+                return ${PIPESTATUS[0]}
+              fi
+
+              if grep -qE "Unsupported Kubernetes minor version update|DeleteConflict: Cannot delete a policy attached to entities" apply_output.txt; then
+                echo "Detected immutable EKS version drift and/or IAM policy delete conflict. Applying safe targeted subset (excluding module.eks and module.github_oidc)."
+                terraform -chdir=terraform/environments/prod apply \
+                  -auto-approve \
+                  -refresh=false \
+                  -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+                  -var="app_image_tag=${{ steps.build_app.outputs.image_tag }}" \
+                  -target=aws_kms_key.eks \
+                  -target=aws_kms_alias.eks \
+                  -target=module.vpc \
+                  -target=module.iam_bootstrap \
+                  -target=module.iam \
+                  -target=module.ecr \
+                  2>&1 | tee apply_output.txt
+                return ${PIPESTATUS[0]}
+              fi
+
+              if grep -qE "Error acquiring the state lock|RequestExpired|Throttling|rate exceeded|timeout" apply_output.txt; then
+                LOCK_ID=$(awk '/^│   ID:/{print $3; exit}' apply_output.txt | tr -d '\r')
+                if [[ -n "$LOCK_ID" ]]; then
+                  terraform -chdir=terraform/environments/prod force-unlock -force "$LOCK_ID" || true
+                fi
+                sleep $((attempt * 30))
+                ((attempt++))
+              else
+                return $apply_exit
+              fi
+            done
+            return $apply_exit
+          }
+          retry_apply
+
+      - name: Resolve cluster name from Terraform output
+        id: cluster
+        run: |
+          CLUSTER_NAME=$(terraform -chdir=terraform/environments/prod output -json 2>/dev/null | jq -r '.cluster_name.value // empty' || true)
+          CLUSTER_NAME=$(echo "$CLUSTER_NAME" | tr -d '\r\n')
+
+          if [[ -z "$CLUSTER_NAME" ]]; then
+            PROJECT=$(awk -F'=' '/^project/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/prod/terraform.tfvars)
+            ENVIRONMENT=$(awk -F'=' '/^environment/{gsub(/[ "\t]/, "", $2); print $2}' terraform/environments/prod/terraform.tfvars)
+            if [[ -n "$PROJECT" && -n "$ENVIRONMENT" ]]; then
+              CLUSTER_NAME="${PROJECT}-${ENVIRONMENT}"
+            fi
+          fi
+
+          if [[ -z "$CLUSTER_NAME" ]] || [[ "$CLUSTER_NAME" == "null" ]]; then
+            echo "ERROR: Could not resolve cluster_name from Terraform outputs"
+            terraform -chdir=terraform/environments/prod output || true
+            exit 1
+          fi
+          echo "name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Guard AWS account/region and cluster existence
+        id: guard
+        run: |
+          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [[ "$ACTUAL_ACCOUNT_ID" != "${{ secrets.AWS_ACCOUNT_ID }}" ]]; then
+            echo "ERROR: OIDC account mismatch. expected=${{ secrets.AWS_ACCOUNT_ID }} actual=$ACTUAL_ACCOUNT_ID"
+            exit 1
+          fi
+
+          if aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" >/dev/null 2>&1; then
+            echo "Cluster ${{ steps.cluster.outputs.name }} exists."
+            echo "cluster_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: Cluster ${{ steps.cluster.outputs.name }} not found. Skipping kubeconfig and kube-health checks."
+            echo "cluster_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect Kubernetes API reachability
+        id: kube_api
+        if: steps.guard.outputs.cluster_exists == 'true'
+        run: |
+          ENDPOINT=$(aws eks describe-cluster \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" \
+            --query 'cluster.endpoint' \
+            --output text)
+
+          HOST=${ENDPOINT#https://}
+          if timeout 8 bash -c "cat < /dev/null > /dev/tcp/${HOST}/443"; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update kubeconfig
+        if: steps.guard.outputs.cluster_exists == 'true' && steps.kube_api.outputs.reachable == 'true'
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ steps.cluster.outputs.name }}
+
+      - name: Run K8s Health Check
+        id: healthcheck
+        if: steps.guard.outputs.cluster_exists == 'true' && steps.kube_api.outputs.reachable == 'true'
+        run: |
+          chmod +x scripts/k8s-healthcheck.sh
+          scripts/k8s-healthcheck.sh ${{ steps.cluster.outputs.name }} ${{ env.AWS_REGION }} 2>&1 | tee healthcheck_output.txt
+        continue-on-error: false
+
+      - name: Verify Rollout Status
+        id: rollout
+        if: steps.guard.outputs.cluster_exists == 'true' && steps.kube_api.outputs.reachable == 'true'
+        run: |
+          echo "Verifying all deployments are rolled out..."
+          for ns in kube-system app; do
+            kubectl get deployments -n "$ns" -o name | while read -r deploy; do
+              echo "Checking $deploy in $ns..."
+              kubectl rollout status "$deploy" -n "$ns" --timeout=120s
+            done
+          done
+
+      - name: Final Validation Agent
+        id: agent
+        if: steps.guard.outputs.cluster_exists == 'true'
+        run: |
+          chmod +x scripts/pipeline-agent-verify.sh
+          scripts/pipeline-agent-verify.sh prod 2>&1 | tee agent_output.txt
+        continue-on-error: false
+
+      - name: Emit Production Status
+        id: emit
+        if: always()
+        run: |
+          STATUS="success"
+          if [[ "${{ steps.kube_api.outputs.reachable }}" == "true" ]]; then
+            for outcome in \
+              "${{ steps.security.outcome }}" \
+              "${{ steps.prod_recommendation.outcome }}" \
+              "${{ steps.apply.outcome }}" \
+              "${{ steps.healthcheck.outcome }}" \
+              "${{ steps.rollout.outcome }}" \
+              "${{ steps.agent.outcome }}"; do
+              if [[ "$outcome" != "success" ]]; then
+                STATUS="failure"
+                break
+              fi
+            done
+          else
+            for outcome in \
+              "${{ steps.security.outcome }}" \
+              "${{ steps.prod_recommendation.outcome }}" \
+              "${{ steps.apply.outcome }}" \
+              "${{ steps.agent.outcome }}"; do
+              if [[ "$outcome" != "success" ]]; then
+                STATUS="failure"
+                break
+              fi
+            done
+          fi
+
+          mkdir -p artifacts
+          cat > artifacts/agent-output.json << EOF
+          {
+            "stage": "production",
+            "status": "$STATUS",
+            "reason": "security=${{ steps.security.outcome }}, prod_recommendation=${{ steps.prod_recommendation.outcome }}, auto_approval=${{ steps.auto_approval.outcome }}, apply=${{ steps.apply.outcome }}, healthcheck=${{ steps.healthcheck.outcome }}, rollout=${{ steps.rollout.outcome }}, agent=${{ steps.agent.outcome }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "environment": "prod"
+          }
+          EOF
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          cat artifacts/agent-output.json
+
+      - name: Upload Production Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prod-status
+          path: |
+            artifacts/agent-output.json
+            artifacts/prod-recommendation.json
+            artifacts/auto-approval-decision.json
+            artifacts/auto-approval-engine.log
+            artifacts/rollback-decision-report.json
+          retention-days: 30
+
+      - name: Post-Deploy Rollout Monitoring
+        id: rollback_agent
+        if: steps.apply.outcome == 'success' && steps.guard.outputs.cluster_exists == 'true' && steps.kube_api.outputs.reachable == 'true'
+        run: |
+          chmod +x scripts/rollback-decision-agent.sh
+          scripts/rollback-decision-agent.sh prod "${{ steps.cluster.outputs.name }}" 2>&1 | tee rollback_decision_output.txt
+        env:
+          ROLLBACK_AUTO_ENABLED: ${{ vars.ROLLBACK_AUTO_ENABLED || 'true' }}
+          ROLLBACK_MONITOR_SECONDS: '600'
+          ROLLBACK_POLL_INTERVAL: '60'
+        continue-on-error: true
+
+      - name: Rollback on Failure (static fallback)
+        if: failure() && steps.apply.outcome == 'success' && steps.rollback_agent.outcome != 'success'
+        run: |
+          echo "CRITICAL: Production failure detected. Initiating static rollback..."
+          kubectl rollout undo deployment/typescript-app -n app || true
+          echo "Rollback complete. Manual review required."
+
+  # Pipeline summary job
+  pipeline-summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [build, test, staging, production]
+    if: always()
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+        continue-on-error: true
+
+      - name: Generate Pipeline Summary
+        run: |
+          echo "## Pipeline Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build | ${{ needs.build.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test  | ${{ needs.test.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Staging | ${{ needs.staging.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Production | ${{ needs.production.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Actor: ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"

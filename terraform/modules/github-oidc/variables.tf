@@ -1,5 +1,5 @@
 variable "github_repo" {
-  description = "GitHub repository in 'org/repo' format (e.g. 'Suzuki3182/eks-platform-claude-test')"
+  description = "GitHub repository in 'org/repo' format (e.g. 'treboto-solvd/solvd-eks-platform-claude-test')"
   type        = string
 }
 

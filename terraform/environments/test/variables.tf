@@ -24,7 +24,7 @@ variable "project" {
 variable "github_repo" {
   description = "GitHub repository in 'org/repo' format"
   type        = string
-  default     = "Suzuki3182/eks-platform-claude-test"
+  default     = "treboto-solvd/solvd-eks-platform-claude-test"
 }
 
 variable "app_image_tag" {

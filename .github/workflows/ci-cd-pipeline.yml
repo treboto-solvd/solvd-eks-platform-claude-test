@@ -2,9 +2,13 @@ name: EKS Platform CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/treboto-eks-spinup
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - feature/treboto-eks-spinup
   workflow_dispatch:
     inputs:
       environment:

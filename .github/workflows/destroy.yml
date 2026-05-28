@@ -118,3 +118,4 @@ jobs:
           name: destroy-log-${{ inputs.environment }}
           path: destroy_output.txt
           retention-days: 30
+          

@@ -418,64 +418,19 @@ jobs:
           import_policy_if_needed "module.iam.aws_iam_policy.cluster_autoscaler[0]" "${CLUSTER_NAME}-cluster-autoscaler-policy"
 
           # ── Import additional existing resources ──
-          import_generic_if_needed() {
-            local tf_addr="$1"
-            local resource_id="$2"
+          # Note: Additional imports (CW log groups, KMS, OIDC provider) are handled
+          # via terraform import blocks or targeted apply to avoid kubernetes/helm
+          # provider initialization errors when the EKS cluster doesn't exist yet.
+          # IAM-only imports (above) work because they only need the AWS provider.
 
-            if terraform -chdir="$TF_DIR" state show "$tf_addr" >/dev/null 2>&1; then
-              echo "State already contains $tf_addr"
-              return 0
-            fi
+          # Import GitHub OIDC IAM role for this environment (AWS-provider-only, safe)
+          import_role_if_needed "module.github_oidc.aws_iam_role.github_actions" "eks-platform-github-actions-${ENVIRONMENT}"
 
-            echo "Importing $resource_id into $tf_addr"
-            set +e
-            import_output=$(terraform -chdir="$TF_DIR" import "$tf_addr" "$resource_id" 2>&1)
-            import_exit=$?
-            set -e
-
-            if [[ $import_exit -ne 0 ]]; then
-              echo "$import_output"
-              if echo "$import_output" | grep -q "Resource already managed by Terraform"; then
-                echo "Import skipped: $tf_addr is already managed in state."
-                return 0
-              fi
-              echo "WARNING: Import of $tf_addr failed (non-fatal, will retry on next run)"
-              return 0
-            fi
-            echo "Successfully imported $tf_addr"
-          }
-
-          # Import OIDC provider (one per account, created by bootstrap)
-          OIDC_PROVIDER_ARN=$(aws iam list-open-id-connect-providers \
-            --query "OpenIDConnectProviderList[?ends_with(Arn, '/token.actions.githubusercontent.com')].Arn | [0]" \
-            --output text 2>/dev/null || true)
-          if [[ -n "$OIDC_PROVIDER_ARN" && "$OIDC_PROVIDER_ARN" != "None" ]]; then
-            import_generic_if_needed "module.github_oidc.aws_iam_openid_connect_provider.github_actions[0]" "$OIDC_PROVIDER_ARN"
-          fi
-
-          # Import IAM policy for terraform state
+          # Import IAM policy for terraform state (AWS-provider-only, safe)
           import_policy_if_needed "module.github_oidc.aws_iam_policy.terraform_state" "eks-platform-github-actions-tfstate-${ENVIRONMENT}"
 
-          # Import CloudWatch Log Groups
-          import_generic_if_needed "module.eks.aws_cloudwatch_log_group.cluster" "/aws/eks/${CLUSTER_NAME}/cluster"
-          import_generic_if_needed "module.vpc.aws_cloudwatch_log_group.flow_logs" "/aws/vpc/${CLUSTER_NAME}/flow-logs"
-
-          # Import KMS alias
-          KMS_ALIAS="alias/${CLUSTER_NAME}"
-          if aws kms describe-key --key-id "$KMS_ALIAS" >/dev/null 2>&1; then
-            import_generic_if_needed "aws_kms_alias.eks" "$KMS_ALIAS"
-            # Also import the KMS key itself
-            KMS_KEY_ID=$(aws kms describe-key --key-id "$KMS_ALIAS" --query 'KeyMetadata.KeyId' --output text 2>/dev/null || true)
-            if [[ -n "$KMS_KEY_ID" && "$KMS_KEY_ID" != "None" ]]; then
-              import_generic_if_needed "aws_kms_key.eks" "$KMS_KEY_ID"
-            fi
-          fi
-
-          # Import VPC flow logs IAM role
+          # Import VPC flow logs IAM role (AWS-provider-only, safe)
           import_role_if_needed "module.vpc.aws_iam_role.flow_logs" "${CLUSTER_NAME}-vpc-flow-logs"
-
-          # Import GitHub OIDC IAM role for this environment
-          import_role_if_needed "module.github_oidc.aws_iam_role.github_actions" "eks-platform-github-actions-${ENVIRONMENT}"
 
       - name: Bootstrap ECR & Build App Image
         id: build_app

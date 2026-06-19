@@ -407,12 +407,12 @@ jobs:
             fi
           done
 
-          # Clean orphaned KMS alias (key will be recreated by Terraform)
+          # Note: Do NOT delete KMS keys here — they may be in use by ECR repos
+          # or other resources. Terraform will manage KMS key lifecycle.
+          # Only delete the KMS alias so Terraform can recreate it.
           if aws kms describe-key --key-id "alias/${CLUSTER_NAME}" >/dev/null 2>&1; then
-            echo "Deleting orphaned KMS alias: alias/${CLUSTER_NAME}"
-            KMS_KEY_ID=$(aws kms describe-key --key-id "alias/${CLUSTER_NAME}" --query 'KeyMetadata.KeyId' --output text)
+            echo "Deleting orphaned KMS alias: alias/${CLUSTER_NAME} (keeping key intact)"
             aws kms delete-alias --alias-name "alias/${CLUSTER_NAME}" 2>/dev/null || true
-            aws kms schedule-key-deletion --key-id "$KMS_KEY_ID" --pending-window-in-days 7 2>/dev/null || true
           fi
 
           echo "Pre-apply cleanup complete."

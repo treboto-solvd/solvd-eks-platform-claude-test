@@ -256,16 +256,7 @@ jobs:
             local env_name="$1"
             local role_name="eks-platform-github-actions-${env_name}"
 
-            if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
-              local role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text)
-              echo "Role already exists: $role_arn"
-              echo "role_arn_${env_name}=$role_arn" >> "$GITHUB_OUTPUT"
-              return 0
-            fi
-
-            echo "Creating IAM role: $role_name"
-
-            # Trust policy for GitHub OIDC
+            # Trust policy for GitHub OIDC — use wildcard to match all sub claim formats
             cat > /tmp/trust-policy-${env_name}.json << TRUSTEOF
           {
             "Version": "2012-10-17",
@@ -281,16 +272,25 @@ jobs:
                     "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
                   },
                   "StringLike": {
-                    "token.actions.githubusercontent.com:sub": [
-                      "repo:${REPO}:environment:${env_name}",
-                      "repo:${REPO}:ref:refs/heads/main"
-                    ]
+                    "token.actions.githubusercontent.com:sub": "repo:${REPO}:*"
                   }
                 }
               }
             ]
           }
           TRUSTEOF
+
+            if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+              local role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text)
+              echo "Role already exists: $role_arn — updating trust policy"
+              aws iam update-assume-role-policy \
+                --role-name "$role_name" \
+                --policy-document "file:///tmp/trust-policy-${env_name}.json"
+              echo "role_arn_${env_name}=$role_arn" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+
+            echo "Creating IAM role: $role_name"
 
             local role_arn=$(aws iam create-role \
               --role-name "$role_name" \

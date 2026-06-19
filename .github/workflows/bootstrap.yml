@@ -47,6 +47,32 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_BOOTSTRAP_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
 
+      - name: Debug AWS Credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_BOOTSTRAP_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_BOOTSTRAP_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+        run: |
+          echo "=== Debug: Credential Format Check ==="
+          KEY_ID="${AWS_ACCESS_KEY_ID}"
+          SECRET="${AWS_SECRET_ACCESS_KEY}"
+          echo "Access Key ID length: ${#KEY_ID}"
+          echo "Access Key ID prefix: ${KEY_ID:0:4}..."
+          echo "Access Key ID has whitespace: $(echo "$KEY_ID" | grep -cP '[\s\n\r]' || echo 0)"
+          echo "Secret Access Key length: ${#SECRET}"
+          echo "Secret Access Key has whitespace: $(echo "$SECRET" | grep -cP '[\s\n\r]' || echo 0)"
+          echo "AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION"
+          echo ""
+          # Trim potential whitespace/newlines
+          CLEAN_KEY_ID=$(echo -n "$KEY_ID" | tr -d '[:space:]')
+          CLEAN_SECRET=$(echo -n "$SECRET" | tr -d '[:space:]')
+          echo "Cleaned Key ID length: ${#CLEAN_KEY_ID}"
+          echo "Cleaned Secret length: ${#CLEAN_SECRET}"
+          echo ""
+          echo "Attempting aws sts get-caller-identity with cleaned creds..."
+          AWS_ACCESS_KEY_ID="$CLEAN_KEY_ID" AWS_SECRET_ACCESS_KEY="$CLEAN_SECRET" \
+            aws sts get-caller-identity --region "$AWS_DEFAULT_REGION" 2>&1 || echo "FAILED with cleaned creds too"
+
       - name: Verify AWS Identity
         id: identity
         env:
@@ -55,6 +81,9 @@ jobs:
           AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
         run: |
           set -euo pipefail
+          # Trim any whitespace/newlines from secrets
+          export AWS_ACCESS_KEY_ID=$(echo -n "$AWS_ACCESS_KEY_ID" | tr -d '[:space:]')
+          export AWS_SECRET_ACCESS_KEY=$(echo -n "$AWS_SECRET_ACCESS_KEY" | tr -d '[:space:]')
           IDENTITY=$(aws sts get-caller-identity)
           echo "$IDENTITY" | jq .
           ACCOUNT_ID=$(echo "$IDENTITY" | jq -r '.Account')

@@ -227,7 +227,7 @@ module "eks" {
   source = "../../modules/eks"
 
   cluster_name       = local.cluster_name
-  cluster_version    = "1.29"
+  cluster_version    = "1.31"
   vpc_id             = module.vpc.vpc_id
   vpc_cidr           = module.vpc.vpc_cidr
   private_subnet_ids = module.vpc.private_subnet_ids
@@ -288,7 +288,7 @@ module "addons" {
   source = "../../modules/addons"
 
   cluster_name                = module.eks.cluster_name
-  cluster_version             = "1.29"
+  cluster_version             = "1.31"
   vpc_cni_role_arn            = module.iam.vpc_cni_role_arn
   ebs_csi_role_arn            = module.iam.ebs_csi_role_arn
   lbc_role_arn                = module.iam.lbc_role_arn
